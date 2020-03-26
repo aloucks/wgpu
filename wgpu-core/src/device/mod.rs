@@ -321,10 +321,10 @@ impl<B: GfxBackend> Device<B> {
         };
 
         let mut buffer = unsafe { self.raw.create_buffer(desc.size, usage).unwrap() };
-        if !desc.label.is_null() {
+        let label = conv::label_from_ptr(desc.label);
+        if !label.is_null() {
             unsafe {
-                let label = ffi::CStr::from_ptr(desc.label).to_string_lossy();
-                self.raw.set_buffer_name(&mut buffer, &label)
+                self.raw.set_buffer_name(&mut buffer, label.as_str().unwrap())
             };
         }
         let requirements = unsafe { self.raw.get_buffer_requirements(&buffer) };
@@ -409,9 +409,9 @@ impl<B: GfxBackend> Device<B> {
                 usage,
                 view_capabilities,
             ).unwrap();
-            if !desc.label.is_null() {
-                let label = ffi::CStr::from_ptr(desc.label).to_string_lossy();
-                self.raw.set_image_name(&mut image, &label);
+            let label = conv::label_from_ptr(desc.label);
+            if !label.is_null() {
+                self.raw.set_image_name(&mut image, label.as_str().unwrap());
             }
             image
         };
@@ -918,9 +918,9 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                 .raw
                 .create_descriptor_set_layout(&raw_bindings, &[])
                 .unwrap();
-            if !desc.label.is_null() {
-                let label = ffi::CStr::from_ptr(desc.label).to_string_lossy();
-                device.raw.set_descriptor_set_layout_name(&mut raw_layout, &label);
+            let label = conv::label_from_ptr(desc.label);
+            if !label.is_null() {
+                device.raw.set_descriptor_set_layout_name(&mut raw_layout, label.as_str().unwrap());
             }
             raw_layout
         };
@@ -1037,10 +1037,10 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             desc_sets.pop().unwrap()
         };
 
-        if !desc.label.is_null() {
+        let label = conv::label_from_ptr(desc.label);
+        if !label.is_null() {
             unsafe {
-                let label = ffi::CStr::from_ptr(desc.label).to_string_lossy();
-                device.raw.set_descriptor_set_name(desc_set.raw_mut(), &label);
+                device.raw.set_descriptor_set_name(desc_set.raw_mut(), label.as_str().unwrap());
             }
         }
 
@@ -1288,9 +1288,9 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             .allocate(dev_stored, &device.raw, device.features, lowest_active_index);
         unsafe {
             let raw_command_buffer = command_buffer.raw.last_mut().unwrap();
-            if !desc.label.is_null() {
-                let label = ffi::CStr::from_ptr(desc.label).to_string_lossy();
-                device.raw.set_command_buffer_name(raw_command_buffer, &label);
+            let label = conv::label_from_ptr(desc.label);
+            if !label.is_null() {
+                device.raw.set_command_buffer_name(raw_command_buffer, label.as_str().unwrap());
             }
             raw_command_buffer.begin_primary(
                 hal::command::CommandBufferFlags::ONE_TIME_SUBMIT,

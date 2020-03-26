@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use std::{ffi, ptr, mem, slice};
+
 use crate::{binding_model, Features};
 use wgt::{
     BlendDescriptor,
@@ -679,4 +681,236 @@ pub fn map_index_format(index_format: IndexFormat) -> hal::IndexType {
         IndexFormat::Uint16 => hal::IndexType::U16,
         IndexFormat::Uint32 => hal::IndexType::U32,
     }
+}
+
+
+// 62 + 1 byte for len + 1 byte for discriminate = 64 bytes for Label enum
+const LABEL_MAX_INLINE_WITH_NULL_LEN: usize = 62;
+
+pub enum Label {
+    Inline {
+        len: u8,
+        bytes_with_nul: [u8; LABEL_MAX_INLINE_WITH_NULL_LEN],
+    },
+    Heap(ffi::CString),
+    Null,
+}
+
+impl Label {
+    pub fn is_null(&self) -> bool {
+        match self {
+            Label::Null => true,
+            _ => false,
+        }
+    }
+    pub fn from_ptr(label: *const std::os::raw::c_char) -> Label {
+        if label.is_null() {
+            Label::Null
+        } else {
+            unsafe {
+                let c_label = ffi::CStr::from_ptr(label);
+                let src = c_label.to_bytes_with_nul();
+                let len = src.len();
+                if len > LABEL_MAX_INLINE_WITH_NULL_LEN {
+                    let mut raw = src.to_vec();
+                    raw.pop(); // remove then nul byte
+                    Label::Heap(ffi::CString::from_vec_unchecked(raw))
+                } else {
+                    let mut data: mem::MaybeUninit<[u8; LABEL_MAX_INLINE_WITH_NULL_LEN]> =
+                        mem::MaybeUninit::uninit();
+                    src.as_ptr().copy_to(data.as_mut_ptr() as _, src.len());
+                    Label::Inline {
+                        bytes_with_nul: data.assume_init(),
+                        len: (len - 1) as _,
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn from_option_str(label: Option<&str>) -> Label {
+        match label {
+            Some(label) => Label::from_str(label),
+            None => Label::Null,
+        }
+    }
+
+    pub fn from_str(label: &str) -> Label {
+        if label.len() < LABEL_MAX_INLINE_WITH_NULL_LEN - 1 {
+            let mut data = unsafe {
+                let mut data: mem::MaybeUninit<[u8; LABEL_MAX_INLINE_WITH_NULL_LEN]> =
+                    mem::MaybeUninit::uninit();
+                let bytes = label.as_bytes();
+                bytes.as_ptr().copy_to(data.as_mut_ptr() as _, bytes.len());
+                data.assume_init()
+            };
+            data[label.len()] = 0;
+            Label::Inline {
+                bytes_with_nul: data,
+                len: label.len() as _,
+            }
+        } else {
+            Label::Heap(ffi::CString::new(label.to_string()).unwrap())
+        }
+    }
+
+    /// Returns the length of the label **without** counting the terminating `nul`.
+    pub fn len(&self) -> usize {
+        match self {
+            Label::Inline{ len, .. } => *len as usize,
+            Label::Heap(s) => s.as_bytes().len(),
+            Label::Null => 0,
+        }
+    }
+
+    /// Returns the label as a pointer, which may be `null`.
+    pub fn as_ptr(&self) -> *const std::os::raw::c_char {
+        match self {
+            Label::Inline { bytes_with_nul: data, .. } => data.as_ptr() as _,
+            Label::Heap(s) => s.as_ptr() as _,
+            Label::Null => ptr::null(),
+        }
+    }
+
+    pub fn as_c_str(&self) -> Option<&ffi::CStr> {
+        unsafe {
+            match self {
+                Label::Null => None,
+                _ => {
+                    let len_with_nul = self.len() + 1;
+                    let bytes: &[u8] = slice::from_raw_parts(self.as_ptr() as _, len_with_nul);
+                    Some(ffi::CStr::from_bytes_with_nul_unchecked(bytes))
+                }
+            }
+        }
+    }
+
+    /// Returns the label an optional `&str` or `None` if it is `null`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must assure that the label contents contain valid `UTF-8`.
+    pub unsafe fn as_str(&self) -> Option<&str> {
+        match self {
+            Label::Null => None,
+            _ => {
+                let bytes: &[u8] = slice::from_raw_parts(self.as_ptr() as _, self.len());
+                Some(std::str::from_utf8_unchecked(bytes))
+            }
+        }
+    }
+}
+
+pub fn label(label: Option<&str>) -> Label {
+    Label::from_option_str(label)
+}
+
+pub fn label_from_ptr(ptr: *const std::os::raw::c_char) -> Label {
+    Label::from_ptr(ptr)
+}
+
+#[test]
+fn test_label_enum_size() {
+    assert_eq!(64, std::mem::size_of::<Label>());
+}
+
+#[test]
+fn test_label_null() {
+    let null_label = Label::from_option_str(None);
+    assert_eq!(ptr::null(), null_label.as_ptr());
+    assert_eq!(None, null_label.as_c_str());
+    assert_eq!(0, null_label.len());
+    assert_eq!(None, unsafe { null_label.as_str() });
+}
+
+#[test]
+fn test_label_null_from_ptr() {
+    let null_label_from_ptr = Label::from_ptr(ptr::null());
+    assert_eq!(ptr::null(), null_label_from_ptr.as_ptr());
+    assert_eq!(None, null_label_from_ptr.as_c_str());
+    assert_eq!(0, null_label_from_ptr.len());
+    assert_eq!(None, unsafe { null_label_from_ptr.as_str() });
+}
+
+#[test]
+fn test_label_inline() {
+    let foo_label = Label::from_option_str(Some("foo"));
+    assert_ne!(ptr::null(), foo_label.as_ptr());
+    assert_ne!(None, foo_label.as_c_str());
+    assert_eq!(3, foo_label.len());
+    assert_eq!(Some("foo"), unsafe { foo_label.as_str() });
+
+    let foo_string_from_ptr = unsafe { ffi::CStr::from_ptr(foo_label.as_ptr()).to_string_lossy() };
+    let foo_string_from_c_str = foo_label.as_c_str().unwrap().to_string_lossy();
+    assert_eq!(foo_string_from_ptr, foo_string_from_c_str);
+    assert_eq!("foo", foo_string_from_ptr);
+}
+
+#[test]
+fn test_label_inline_from_ptr() {
+    let foo_label = Label::from_ptr(b"foo\0".as_ptr() as _);
+    assert_ne!(ptr::null(), foo_label.as_ptr());
+    assert_ne!(None, foo_label.as_c_str());
+    assert_eq!(3, foo_label.len());
+    assert_eq!(Some("foo"), unsafe { foo_label.as_str() });
+
+    let foo_string_from_ptr = unsafe { ffi::CStr::from_ptr(foo_label.as_ptr()).to_string_lossy() };
+    let foo_string_from_c_str = foo_label.as_c_str().unwrap().to_string_lossy();
+    assert_eq!(foo_string_from_ptr, foo_string_from_c_str);
+    assert_eq!("foo", foo_string_from_ptr);
+}
+
+#[test]
+fn test_label_heap() {
+    let long_string = std::iter::repeat('a')
+        .take(LABEL_MAX_INLINE_WITH_NULL_LEN)
+        .collect::<String>();
+    let long_string_len = long_string.len();
+
+    let long_string_label = Label::from_option_str(Some(&long_string));
+
+    match long_string_label {
+        Label::Inline { .. } | Label::Null => {
+            panic!("The test_label_heap test should heap allocate");
+        }
+        Label::Heap(_) => {}
+    }
+    assert_ne!(ptr::null(), long_string_label.as_ptr());
+    assert_ne!(None, long_string_label.as_c_str());
+    assert_eq!(long_string_len, long_string_label.len());
+    assert_eq!(Some(long_string.as_str()), unsafe { long_string_label.as_str() });
+
+    let long_string_from_ptr =
+        unsafe { ffi::CStr::from_ptr(long_string_label.as_ptr()).to_string_lossy() };
+    let long_string_from_c_str = long_string_label.as_c_str().unwrap().to_string_lossy();
+    assert_eq!(long_string_from_ptr, long_string_from_c_str);
+    assert_eq!(long_string, long_string_from_ptr);
+}
+
+#[test]
+fn test_label_heap_from_ptr() {
+    let long_string = std::iter::repeat('a')
+        .take(LABEL_MAX_INLINE_WITH_NULL_LEN)
+        .collect::<String>();
+    let long_string_len = long_string.len();
+
+    let long_string_with_nul = ffi::CString::new(long_string.clone()).unwrap();
+    let long_string_label = Label::from_ptr(long_string_with_nul.as_ptr() as _);
+
+    match long_string_label {
+        Label::Inline { .. } | Label::Null => {
+            panic!("The test_label_heap test should heap allocate");
+        }
+        Label::Heap(_) => {}
+    }
+    assert_ne!(ptr::null(), long_string_label.as_ptr());
+    assert_ne!(None, long_string_label.as_c_str());
+    assert_eq!(long_string_len, long_string_label.len());
+    assert_eq!(Some(long_string.as_str()), unsafe { long_string_label.as_str() });
+
+    let long_string_from_ptr =
+        unsafe { ffi::CStr::from_ptr(long_string_label.as_ptr()).to_string_lossy() };
+    let long_string_from_c_str = long_string_label.as_c_str().unwrap().to_string_lossy();
+    assert_eq!(long_string_from_ptr, long_string_from_c_str);
+    assert_eq!(long_string, long_string_from_ptr);
 }
